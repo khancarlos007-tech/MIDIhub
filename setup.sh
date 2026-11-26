@@ -38,13 +38,21 @@ cat > "app/src/main/AndroidManifest.xml" <<'EOF_MP'
             </intent-filter>
         </activity>
         <service android:name=".KeepAliveService" android:exported="false" />
-        <service android:name=".HubService" android:exported="true"
+        <service android:name=".HubServiceA" android:exported="true"
             android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
             <intent-filter>
                 <action android:name="android.media.midi.MidiDeviceService" />
             </intent-filter>
             <meta-data android:name="android.media.midi.MidiDeviceService"
-                android:resource="@xml/hub" />
+                android:resource="@xml/hub_a" />
+        </service>
+        <service android:name=".HubServiceB" android:exported="true"
+            android:permission="android.permission.BIND_MIDI_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.media.midi.MidiDeviceService" />
+            </intent-filter>
+            <meta-data android:name="android.media.midi.MidiDeviceService"
+                android:resource="@xml/hub_b" />
         </service>
     </application>
 </manifest>
@@ -56,18 +64,20 @@ package cat.midipatch
 import android.media.midi.MidiDeviceService
 import android.media.midi.MidiReceiver
 
-/** Dispositiu virtual que veu uae4arm. El que l'app hi envia arriba a Router.fromHub. */
-class HubService : MidiDeviceService() {
+/** Dispositiu virtual. Tot el que hi arriba surt pel dispositiu "germà" (A <-> B) i per les connexions del patchbay. */
+open class HubService(private val id: Int) : MidiDeviceService() {
     override fun onCreate() {
         super.onCreate()
-        Router.hubOut = { outputPortReceivers }
+        Router.hubOut[id] = { outputPortReceivers }
     }
     private val fromApp = object : MidiReceiver() {
         override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) =
-            Router.fromHub(data, offset, count, timestamp)
+            Router.fromHub(id, data, offset, count, timestamp)
     }
     override fun onGetInputPortReceivers(): Array<MidiReceiver> = arrayOf(fromApp)
 }
+class HubServiceA : HubService(1)
+class HubServiceB : HubService(2)
 EOF_MP
 mkdir -p "app/src/main/java/cat/midipatch"
 cat > "app/src/main/java/cat/midipatch/KeepAliveService.kt" <<'EOF_MP'
@@ -157,13 +167,15 @@ import android.content.Context
 import android.media.midi.*
 import android.os.Handler
 import android.os.Looper
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 
 object Router {
-    /** info == null vol dir "el Hub propi de MidiPatch" (el que veu uae4arm). */
-    class Port(val info: MidiDeviceInfo?, val index: Int, val isSource: Boolean) {
+    /** hub: 0 = dispositiu real; 1 = MidiPatch A; 2 = MidiPatch B. */
+    class Port(val info: MidiDeviceInfo?, val index: Int, val isSource: Boolean, val hub: Int = 0) {
         val name: String get() {
-            val i = info ?: return if (isSource) "MidiPatch Hub: el que envia l'app (uae4arm)" else "MidiPatch Hub: cap a l'app (uae4arm)"
+            val i = info ?: return "MidiPatch ${if (hub == 1) "A" else "B"}: " +
+                if (isSource) "el que envia l'app" else "cap a l'app"
             val p = i.properties
             val dev = p.getString(MidiDeviceInfo.PROPERTY_NAME)
                 ?: p.getString(MidiDeviceInfo.PROPERTY_PRODUCT) ?: "Dispositiu ${i.id}"
@@ -179,15 +191,21 @@ object Router {
     private lateinit var mgr: MidiManager
     private val h = Handler(Looper.getMainLooper())
 
-    // --- Hub intern ---
-    var hubOut: (() -> Array<MidiReceiver>)? = null
-    private val hubSinks = CopyOnWriteArrayList<MidiReceiver>()
-    fun fromHub(d: ByteArray, o: Int, c: Int, t: Long) { for (s in hubSinks) s.send(d, o, c, t) }
-    private val toHub = object : MidiReceiver() {
+    // --- Hubs interns (1 = A, 2 = B) ---
+    val hubOut = ConcurrentHashMap<Int, () -> Array<MidiReceiver>>()
+    private val hubSinks = mapOf(1 to CopyOnWriteArrayList<MidiReceiver>(), 2 to CopyOnWriteArrayList<MidiReceiver>())
+
+    /** Dades rebudes pel hub [id]: van al germà (creuat) i a les connexions del patchbay. */
+    fun fromHub(id: Int, d: ByteArray, o: Int, c: Int, t: Long) {
+        hubOut[3 - id]?.invoke()?.forEach { it.send(d, o, c, t) }
+        hubSinks[id]?.forEach { it.send(d, o, c, t) }
+    }
+    private fun makeTo(id: Int) = object : MidiReceiver() {
         override fun onSend(d: ByteArray, o: Int, c: Int, t: Long) {
-            hubOut?.invoke()?.forEach { it.send(d, o, c, t) }
+            hubOut[id]?.invoke()?.forEach { it.send(d, o, c, t) }
         }
     }
+    private val toHub = mapOf(1 to makeTo(1), 2 to makeTo(2))
 
     fun init(c: Context) { mgr = c.applicationContext.getSystemService(Context.MIDI_SERVICE) as MidiManager }
 
@@ -206,18 +224,18 @@ object Router {
         val devs = mgr.devices
             .filter { it.properties.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER) != "MidiPatch" }
             .flatMap { d -> d.ports.filter { it.type == t }.map { Port(d, it.portNumber, sources) } }
-        return listOf(Port(null, 0, sources)) + devs
+        return listOf(Port(null, 0, sources, 1), Port(null, 0, sources, 2)) + devs
     }
 
     fun connect(src: Port, dst: Port, done: (String?) -> Unit) {
         val si = src.info; val di = dst.info
-        if (si == null && di == null) return done("Origen i destí no poden ser el Hub alhora")
+        if (si == null && di == null) return done("Origen i destí no poden ser tots dos MidiPatch (ja van creuats A↔B)")
         if (si == null) { // Hub -> dispositiu
             mgr.openDevice(di, { d ->
                 if (d == null) return@openDevice done("No s'ha pogut obrir ${dst.name}")
                 val inp = d.openInputPort(dst.index)
                 if (inp == null) { d.close(); return@openDevice done("Port ocupat: ${dst.name}") }
-                hubSinks.add(inp); links.add(Link(src, dst, listOf(d), null, inp, inp)); done(null)
+                hubSinks[src.hub]?.add(inp); links.add(Link(src, dst, listOf(d), null, inp, inp)); done(null)
             }, h)
             return
         }
@@ -226,7 +244,8 @@ object Router {
                 if (d == null) return@openDevice done("No s'ha pogut obrir ${src.name}")
                 val out = d.openOutputPort(src.index)
                 if (out == null) { d.close(); return@openDevice done("Port no disponible: ${src.name}") }
-                out.connect(toHub); links.add(Link(src, dst, listOf(d), out, toHub, null)); done(null)
+                val r = toHub.getValue(dst.hub)
+                out.connect(r); links.add(Link(src, dst, listOf(d), out, r, null)); done(null)
             }, h)
             return
         }
@@ -247,7 +266,7 @@ object Router {
     fun disconnect(l: Link) {
         try {
             l.out?.disconnect(l.recv)
-            if (l.src.info == null) hubSinks.remove(l.recv)
+            if (l.src.hub != 0) hubSinks[l.src.hub]?.remove(l.recv)
             l.inp?.close(); l.out?.close(); l.devs.forEach { it.close() }
         } catch (_: Exception) {}
         links.remove(l)
@@ -255,11 +274,20 @@ object Router {
 }
 EOF_MP
 mkdir -p "app/src/main/res/xml"
-cat > "app/src/main/res/xml/hub.xml" <<'EOF_MP'
+cat > "app/src/main/res/xml/hub_a.xml" <<'EOF_MP'
 <devices>
-    <device manufacturer="MidiPatch" product="MidiPatch Hub">
-        <input-port name="Rep de l'app" />
-        <output-port name="Envia a l'app" />
+    <device manufacturer="MidiPatch" product="MidiPatch A">
+        <input-port name="Rep" />
+        <output-port name="Envia" />
+    </device>
+</devices>
+EOF_MP
+mkdir -p "app/src/main/res/xml"
+cat > "app/src/main/res/xml/hub_b.xml" <<'EOF_MP'
+<devices>
+    <device manufacturer="MidiPatch" product="MidiPatch B">
+        <input-port name="Rep" />
+        <output-port name="Envia" />
     </device>
 </devices>
 EOF_MP
