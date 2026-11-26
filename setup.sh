@@ -56,14 +56,17 @@ package cat.midipatch
 import android.media.midi.MidiDeviceService
 import android.media.midi.MidiReceiver
 
-/** Port virtual: el que arriba a "Hub In" surt per "Hub Out" (que pot llegir qualsevol app). */
+/** Dispositiu virtual que veu uae4arm. El que l'app hi envia arriba a Router.fromHub. */
 class HubService : MidiDeviceService() {
-    private val fwd = object : MidiReceiver() {
-        override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) {
-            for (r in outputPortReceivers) r.send(data, offset, count, timestamp)
-        }
+    override fun onCreate() {
+        super.onCreate()
+        Router.hubOut = { outputPortReceivers }
     }
-    override fun onGetInputPortReceivers(): Array<MidiReceiver> = arrayOf(fwd)
+    private val fromApp = object : MidiReceiver() {
+        override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) =
+            Router.fromHub(data, offset, count, timestamp)
+    }
+    override fun onGetInputPortReceivers(): Array<MidiReceiver> = arrayOf(fromApp)
 }
 EOF_MP
 mkdir -p "app/src/main/java/cat/midipatch"
@@ -154,60 +157,99 @@ import android.content.Context
 import android.media.midi.*
 import android.os.Handler
 import android.os.Looper
+import java.util.concurrent.CopyOnWriteArrayList
 
 object Router {
-    class Port(val info: MidiDeviceInfo, val index: Int, val isSource: Boolean) {
+    /** info == null vol dir "el Hub propi de MidiPatch" (el que veu uae4arm). */
+    class Port(val info: MidiDeviceInfo?, val index: Int, val isSource: Boolean) {
         val name: String get() {
-            val p = info.properties
+            val i = info ?: return if (isSource) "MidiPatch Hub: el que envia l'app (uae4arm)" else "MidiPatch Hub: cap a l'app (uae4arm)"
+            val p = i.properties
             val dev = p.getString(MidiDeviceInfo.PROPERTY_NAME)
-                ?: p.getString(MidiDeviceInfo.PROPERTY_PRODUCT) ?: "Dispositiu ${info.id}"
-            val port = info.ports.firstOrNull { it.portNumber == index &&
-                it.type == (if (isSource) MidiDeviceInfo.PortInfo.TYPE_OUTPUT else MidiDeviceInfo.PortInfo.TYPE_INPUT) }?.name
+                ?: p.getString(MidiDeviceInfo.PROPERTY_PRODUCT) ?: "Dispositiu ${i.id}"
+            val t = if (isSource) MidiDeviceInfo.PortInfo.TYPE_OUTPUT else MidiDeviceInfo.PortInfo.TYPE_INPUT
+            val port = i.ports.firstOrNull { it.portNumber == index && it.type == t }?.name
             return if (port.isNullOrEmpty()) "$dev #$index" else "$dev: $port"
         }
     }
-    class Link(val src: Port, val dst: Port, val d1: MidiDevice, val d2: MidiDevice,
-               val out: MidiOutputPort, val inp: MidiInputPort)
+    class Link(val src: Port, val dst: Port, val devs: List<MidiDevice>,
+               val out: MidiOutputPort?, val recv: MidiReceiver, val inp: MidiInputPort?)
 
     val links = mutableListOf<Link>()
     private lateinit var mgr: MidiManager
     private val h = Handler(Looper.getMainLooper())
+
+    // --- Hub intern ---
+    var hubOut: (() -> Array<MidiReceiver>)? = null
+    private val hubSinks = CopyOnWriteArrayList<MidiReceiver>()
+    fun fromHub(d: ByteArray, o: Int, c: Int, t: Long) { for (s in hubSinks) s.send(d, o, c, t) }
+    private val toHub = object : MidiReceiver() {
+        override fun onSend(d: ByteArray, o: Int, c: Int, t: Long) {
+            hubOut?.invoke()?.forEach { it.send(d, o, c, t) }
+        }
+    }
 
     fun init(c: Context) { mgr = c.applicationContext.getSystemService(Context.MIDI_SERVICE) as MidiManager }
 
     fun listen(cb: () -> Unit) {
         mgr.registerDeviceCallback(object : MidiManager.DeviceCallback() {
             override fun onDeviceAdded(d: MidiDeviceInfo) = cb()
-            override fun onDeviceRemoved(d: MidiDeviceInfo) { links.removeAll { it.src.info.id == d.id || it.dst.info.id == d.id }; cb() }
+            override fun onDeviceRemoved(d: MidiDeviceInfo) {
+                links.removeAll { it.src.info?.id == d.id || it.dst.info?.id == d.id }; cb()
+            }
         }, h)
     }
 
     @Suppress("DEPRECATION")
-    fun ports(sources: Boolean): List<Port> = mgr.devices.flatMap { d ->
-        d.ports.filter { it.type == (if (sources) MidiDeviceInfo.PortInfo.TYPE_OUTPUT else MidiDeviceInfo.PortInfo.TYPE_INPUT) }
-            .map { Port(d, it.portNumber, sources) }
+    fun ports(sources: Boolean): List<Port> {
+        val t = if (sources) MidiDeviceInfo.PortInfo.TYPE_OUTPUT else MidiDeviceInfo.PortInfo.TYPE_INPUT
+        val devs = mgr.devices
+            .filter { it.properties.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER) != "MidiPatch" }
+            .flatMap { d -> d.ports.filter { it.type == t }.map { Port(d, it.portNumber, sources) } }
+        return listOf(Port(null, 0, sources)) + devs
     }
 
     fun connect(src: Port, dst: Port, done: (String?) -> Unit) {
-        mgr.openDevice(src.info, { d1 ->
+        val si = src.info; val di = dst.info
+        if (si == null && di == null) return done("Origen i destí no poden ser el Hub alhora")
+        if (si == null) { // Hub -> dispositiu
+            mgr.openDevice(di, { d ->
+                if (d == null) return@openDevice done("No s'ha pogut obrir ${dst.name}")
+                val inp = d.openInputPort(dst.index)
+                if (inp == null) { d.close(); return@openDevice done("Port ocupat: ${dst.name}") }
+                hubSinks.add(inp); links.add(Link(src, dst, listOf(d), null, inp, inp)); done(null)
+            }, h)
+            return
+        }
+        if (di == null) { // dispositiu -> Hub
+            mgr.openDevice(si, { d ->
+                if (d == null) return@openDevice done("No s'ha pogut obrir ${src.name}")
+                val out = d.openOutputPort(src.index)
+                if (out == null) { d.close(); return@openDevice done("Port no disponible: ${src.name}") }
+                out.connect(toHub); links.add(Link(src, dst, listOf(d), out, toHub, null)); done(null)
+            }, h)
+            return
+        }
+        mgr.openDevice(si, { d1 ->
             if (d1 == null) return@openDevice done("No s'ha pogut obrir ${src.name}")
-            mgr.openDevice(dst.info, { d2 ->
+            mgr.openDevice(di, { d2 ->
                 if (d2 == null) { d1.close(); return@openDevice done("No s'ha pogut obrir ${dst.name}") }
-                val out = d1.openOutputPort(src.index)
-                val inp = d2.openInputPort(dst.index)
+                val out = d1.openOutputPort(src.index); val inp = d2.openInputPort(dst.index)
                 if (out == null || inp == null) {
                     out?.close(); inp?.close(); d1.close(); d2.close()
                     return@openDevice done("Port ocupat: una altra app ja hi està connectada (${dst.name})")
                 }
-                out.connect(inp)
-                links.add(Link(src, dst, d1, d2, out, inp))
-                done(null)
+                out.connect(inp); links.add(Link(src, dst, listOf(d1, d2), out, inp, inp)); done(null)
             }, h)
         }, h)
     }
 
     fun disconnect(l: Link) {
-        try { l.out.disconnect(l.inp); l.inp.close(); l.out.close(); l.d1.close(); l.d2.close() } catch (_: Exception) {}
+        try {
+            l.out?.disconnect(l.recv)
+            if (l.src.info == null) hubSinks.remove(l.recv)
+            l.inp?.close(); l.out?.close(); l.devs.forEach { it.close() }
+        } catch (_: Exception) {}
         links.remove(l)
     }
 }
@@ -215,9 +257,9 @@ EOF_MP
 mkdir -p "app/src/main/res/xml"
 cat > "app/src/main/res/xml/hub.xml" <<'EOF_MP'
 <devices>
-    <device manufacturer="MidiPatch" product="MIDI Hub">
-        <input-port name="Hub In" />
-        <output-port name="Hub Out" />
+    <device manufacturer="MidiPatch" product="MidiPatch Hub">
+        <input-port name="Rep de l'app" />
+        <output-port name="Envia a l'app" />
     </device>
 </devices>
 EOF_MP
