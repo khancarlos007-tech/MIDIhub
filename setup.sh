@@ -119,6 +119,7 @@ class MainActivity : Activity() {
     private lateinit var dstSp: Spinner
     private lateinit var list: ListView
     private lateinit var status: TextView
+    private lateinit var diag: TextView
     private var srcs = listOf<Router.Port>()
     private var dsts = listOf<Router.Port>()
 
@@ -130,13 +131,14 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32) }
         fun label(t: String) = TextView(this).apply { text = t; textSize = 16f }
-        srcSp = Spinner(this); dstSp = Spinner(this); list = ListView(this); status = TextView(this)
+        srcSp = Spinner(this); dstSp = Spinner(this); list = ListView(this); status = TextView(this); diag = TextView(this)
         val btn = Button(this).apply { text = "Connecta" }
         root.addView(label("Origen (sortida MIDI)")); root.addView(srcSp)
         root.addView(label("Destí (entrada MIDI)")); root.addView(dstSp)
         root.addView(btn); root.addView(status)
-        root.addView(label("Connexions actives (toca per desconnectar)")); root.addView(list)
-        setContentView(root)
+        root.addView(label("Connexions actives (toca per desconnectar)")); root.addView(list, LinearLayout.LayoutParams(-1, 500))
+        root.addView(label("Dispositius MIDI del sistema (en l'ordre real)")); root.addView(diag)
+        setContentView(ScrollView(this).apply { addView(root) })
 
         btn.setOnClickListener {
             val s = srcs.getOrNull(srcSp.selectedItemPosition); val d = dsts.getOrNull(dstSp.selectedItemPosition)
@@ -151,6 +153,7 @@ class MainActivity : Activity() {
     }
 
     private fun refresh() {
+        diag.text = Router.diag()
         srcs = Router.ports(true); dsts = Router.ports(false)
         fun ad(l: List<String>) = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, l)
         srcSp.adapter = ad(srcs.map { it.name }); dstSp.adapter = ad(dsts.map { it.name })
@@ -225,6 +228,15 @@ object Router {
             .filter { it.properties.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER) != "MidiPatch" }
             .flatMap { d -> d.ports.filter { it.type == t }.map { Port(d, it.portNumber, sources) } }
         return listOf(Port(null, 0, sources, 1), Port(null, 0, sources, 2)) + devs
+    }
+
+    @Suppress("DEPRECATION")
+    fun diag(): String = mgr.devices.joinToString("\n\n") { d ->
+        val p = d.properties
+        val svc = p.getParcelable<android.content.pm.ServiceInfo>(MidiDeviceInfo.PROPERTY_SERVICE_INFO)
+        "id ${d.id} · ${p.getString(MidiDeviceInfo.PROPERTY_NAME)}\n" +
+        "  fabricant: ${p.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER)} · entrades: ${d.inputPortCount} · sortides: ${d.outputPortCount}\n" +
+        "  " + (svc?.let { it.packageName + " / " + it.name } ?: "(USB, Bluetooth o sense servei)")
     }
 
     fun connect(src: Port, dst: Port, done: (String?) -> Unit) {
