@@ -120,6 +120,8 @@ class MainActivity : Activity() {
     private lateinit var list: ListView
     private lateinit var status: TextView
     private lateinit var diag: TextView
+    private lateinit var mon: TextView
+    private val tick = object : Runnable { override fun run() { mon.text = Router.monitor(); mon.postDelayed(this, 300) } }
     private var srcs = listOf<Router.Port>()
     private var dsts = listOf<Router.Port>()
 
@@ -131,11 +133,12 @@ class MainActivity : Activity() {
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 32, 32, 32) }
         fun label(t: String) = TextView(this).apply { text = t; textSize = 16f }
-        srcSp = Spinner(this); dstSp = Spinner(this); list = ListView(this); status = TextView(this); diag = TextView(this)
+        srcSp = Spinner(this); dstSp = Spinner(this); list = ListView(this); status = TextView(this); diag = TextView(this); mon = TextView(this)
         val btn = Button(this).apply { text = "Connecta" }
         root.addView(label("Origen (sortida MIDI)")); root.addView(srcSp)
         root.addView(label("Destí (entrada MIDI)")); root.addView(dstSp)
         root.addView(btn); root.addView(status)
+        root.addView(label("Monitor MIDI (rebut pels dispositius virtuals)")); root.addView(mon)
         root.addView(label("Connexions actives (toca per desconnectar)")); root.addView(list, LinearLayout.LayoutParams(-1, 500))
         root.addView(label("Dispositius MIDI del sistema (en l'ordre real)")); root.addView(diag)
         setContentView(ScrollView(this).apply { addView(root) })
@@ -150,7 +153,9 @@ class MainActivity : Activity() {
         }
         Router.listen { runOnUiThread { refresh() } }
         refresh()
+        mon.post(tick)
     }
+    override fun onDestroy() { mon.removeCallbacks(tick); super.onDestroy() }
 
     private fun refresh() {
         diag.text = Router.diag()
@@ -199,7 +204,18 @@ object Router {
     private val hubSinks = mapOf(1 to CopyOnWriteArrayList<MidiReceiver>(), 2 to CopyOnWriteArrayList<MidiReceiver>())
 
     /** Dades rebudes pel hub [id]: van al germà (creuat) i a les connexions del patchbay. */
+    class Stat { var bytes = 0L; val log = StringBuilder() }
+    private val stats = mapOf(1 to Stat(), 2 to Stat())
+    fun monitor(): String = stats.entries.joinToString("\n\n") { (id, st) ->
+        synchronized(st) { "MidiPatch ${if (id == 1) "A" else "B"}: ${st.bytes} bytes rebuts\n  últims: ${st.log}" }
+    }
+
     fun fromHub(id: Int, d: ByteArray, o: Int, c: Int, t: Long) {
+        stats[id]?.let { st -> synchronized(st) {
+            st.bytes += c
+            for (i in o until o + c) st.log.append(String.format("%02X ", d[i]))
+            if (st.log.length > 240) st.log.delete(0, st.log.length - 240)
+        } }
         hubOut[3 - id]?.invoke()?.forEach { it.send(d, o, c, t) }
         hubSinks[id]?.forEach { it.send(d, o, c, t) }
     }
