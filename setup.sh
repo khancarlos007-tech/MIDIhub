@@ -233,9 +233,10 @@ object Router {
     @Suppress("DEPRECATION")
     fun diag(): String = mgr.devices.joinToString("\n\n") { d ->
         val p = d.properties
-        val svc = p.getParcelable<android.content.pm.ServiceInfo>(MidiDeviceInfo.PROPERTY_SERVICE_INFO)
+        val svc = p.getParcelable<android.content.pm.ServiceInfo>("service_info")
         "id ${d.id} · ${p.getString(MidiDeviceInfo.PROPERTY_NAME)}\n" +
         "  fabricant: ${p.getString(MidiDeviceInfo.PROPERTY_MANUFACTURER)} · entrades: ${d.inputPortCount} · sortides: ${d.outputPortCount}\n" +
+        "  propietats: " + p.keySet().joinToString { k -> "$k=${p.get(k)}" } + "\n" +
         "  " + (svc?.let { it.packageName + " / " + it.name } ?: "(USB, Bluetooth o sense servei)")
     }
 
