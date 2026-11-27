@@ -62,6 +62,7 @@ cat > "app/src/main/java/cat/midipatch/HubService.kt" <<'EOF_MP'
 package cat.midipatch
 
 import android.media.midi.MidiDeviceService
+import android.media.midi.MidiDeviceStatus
 import android.media.midi.MidiReceiver
 
 /** Dispositiu virtual. Tot el que hi arriba surt pel dispositiu "germà" (A <-> B) i per les connexions del patchbay. */
@@ -73,6 +74,9 @@ open class HubService(private val id: Int) : MidiDeviceService() {
     private val fromApp = object : MidiReceiver() {
         override fun onSend(data: ByteArray, offset: Int, count: Int, timestamp: Long) =
             Router.fromHub(id, data, offset, count, timestamp)
+    }
+    override fun onDeviceStatusChanged(status: MidiDeviceStatus) {
+        Router.hubStatus[id] = "entrada oberta: ${if (status.isInputPortOpen(0)) "sí" else "no"} · sortida oberta per ${status.getOutputPortOpenCount(0)} client(s)"
     }
     override fun onGetInputPortReceivers(): Array<MidiReceiver> = arrayOf(fromApp)
 }
@@ -204,10 +208,15 @@ object Router {
     private val hubSinks = mapOf(1 to CopyOnWriteArrayList<MidiReceiver>(), 2 to CopyOnWriteArrayList<MidiReceiver>())
 
     /** Dades rebudes pel hub [id]: van al germà (creuat) i a les connexions del patchbay. */
-    class Stat { var bytes = 0L; val log = StringBuilder() }
+    class Stat { var bytes = 0L; var fwd = 0L; val log = StringBuilder() }
+    val hubStatus = ConcurrentHashMap<Int, String>()
     private val stats = mapOf(1 to Stat(), 2 to Stat())
     fun monitor(): String = stats.entries.joinToString("\n\n") { (id, st) ->
-        synchronized(st) { "MidiPatch ${if (id == 1) "A" else "B"}: ${st.bytes} bytes rebuts\n  últims: ${st.log}" }
+        val me = if (id == 1) "A" else "B"; val other = if (id == 1) "B" else "A"
+        synchronized(st) {
+            "MidiPatch $me: ${st.bytes} bytes rebuts · ${st.fwd} reenviats a $other (servei $other actiu: ${if (hubOut.containsKey(3 - id)) "sí" else "no"})\n" +
+            "  ports de $me: ${hubStatus[id] ?: "cap client connectat encara"}\n  últims: ${st.log}"
+        }
     }
 
     fun fromHub(id: Int, d: ByteArray, o: Int, c: Int, t: Long) {
@@ -216,7 +225,11 @@ object Router {
             for (i in o until o + c) st.log.append(String.format("%02X ", d[i]))
             if (st.log.length > 240) st.log.delete(0, st.log.length - 240)
         } }
-        hubOut[3 - id]?.invoke()?.forEach { it.send(d, o, c, t) }
+        val sib = hubOut[3 - id]?.invoke()
+        if (sib != null) {
+            sib.forEach { it.send(d, o, c, t) }
+            stats[id]?.let { synchronized(it) { it.fwd += c } }
+        }
         hubSinks[id]?.forEach { it.send(d, o, c, t) }
     }
     private fun makeTo(id: Int) = object : MidiReceiver() {
@@ -306,8 +319,8 @@ mkdir -p "app/src/main/res/xml"
 cat > "app/src/main/res/xml/hub_a.xml" <<'EOF_MP'
 <devices>
     <device manufacturer="MidiPatch" product="MidiPatch A">
-        <input-port name="Rep" />
-        <output-port name="Envia" />
+        <input-port name="A rep" />
+        <output-port name="A envia" />
     </device>
 </devices>
 EOF_MP
@@ -315,8 +328,8 @@ mkdir -p "app/src/main/res/xml"
 cat > "app/src/main/res/xml/hub_b.xml" <<'EOF_MP'
 <devices>
     <device manufacturer="MidiPatch" product="MidiPatch B">
-        <input-port name="Rep" />
-        <output-port name="Envia" />
+        <input-port name="B rep" />
+        <output-port name="B envia" />
     </device>
 </devices>
 EOF_MP
