@@ -139,9 +139,11 @@ class MainActivity : Activity() {
         fun label(t: String) = TextView(this).apply { text = t; textSize = 16f }
         srcSp = Spinner(this); dstSp = Spinner(this); list = ListView(this); status = TextView(this); diag = TextView(this); mon = TextView(this)
         val btn = Button(this).apply { text = "Connecta" }
+        val cbPace = CheckBox(this).apply { text = "Limita la velocitat cap a uae4arm (31250 baud)"; isChecked = true; setOnCheckedChangeListener { _, v -> Router.pace = v } }
+        val cbFilt = CheckBox(this).apply { text = "Filtra rellotge i actius (F8/FE) cap a uae4arm"; setOnCheckedChangeListener { _, v -> Router.filterRt = v } }
         root.addView(label("Origen (sortida MIDI)")); root.addView(srcSp)
         root.addView(label("Destí (entrada MIDI)")); root.addView(dstSp)
-        root.addView(btn); root.addView(status)
+        root.addView(btn); root.addView(status); root.addView(cbPace); root.addView(cbFilt)
         root.addView(label("Monitor MIDI (rebut pels dispositius virtuals)")); root.addView(mon)
         root.addView(label("Connexions actives (toca per desconnectar)")); root.addView(list, LinearLayout.LayoutParams(-1, 500))
         root.addView(label("Dispositius MIDI del sistema (en l'ordre real)")); root.addView(diag)
@@ -210,8 +212,17 @@ object Router {
     /** Dades rebudes pel hub [id]: van al germà (creuat) i a les connexions del patchbay. */
     class Stat { var bytes = 0L; var fwd = 0L; val log = StringBuilder() }
     val hubStatus = ConcurrentHashMap<Int, String>()
+    @Volatile var pace = true
+    @Volatile var filterRt = false
+    private fun pacerInfo() = "Cua cap a uae4arm: ${Pacer.queued} bytes · descartats: ${Pacer.dropped}\n\n"
+    private fun slice(d: ByteArray, o: Int, c: Int): ByteArray {
+        if (!filterRt) return d.copyOfRange(o, o + c)
+        val out = java.io.ByteArrayOutputStream(c)
+        for (i in o until o + c) { val b = d[i].toInt() and 0xFF; if (b != 0xF8 && b != 0xFE) out.write(b) }
+        return out.toByteArray()
+    }
     private val stats = mapOf(1 to Stat(), 2 to Stat())
-    fun monitor(): String = stats.entries.joinToString("\n\n") { (id, st) ->
+    fun monitor(): String = pacerInfo() + stats.entries.joinToString("\n\n") { (id, st) ->
         val me = if (id == 1) "A" else "B"; val other = if (id == 1) "B" else "A"
         synchronized(st) {
             "MidiPatch $me: ${st.bytes} bytes rebuts · ${st.fwd} reenviats a $other (servei $other actiu: ${if (hubOut.containsKey(3 - id)) "sí" else "no"})\n" +
@@ -225,9 +236,13 @@ object Router {
             for (i in o until o + c) st.log.append(String.format("%02X ", d[i]))
             if (st.log.length > 240) st.log.delete(0, st.log.length - 240)
         } }
-        val sib = hubOut[3 - id]?.invoke()
+        val tgt = 3 - id
+        val sib = hubOut[tgt]?.invoke()
         if (sib != null) {
-            sib.forEach { it.send(d, o, c, t) }
+            if (tgt == 1) { // cap a uae4arm (escolta A)
+                val x = slice(d, o, c)
+                if (pace) Pacer.push(x) else if (x.isNotEmpty()) sib.forEach { it.send(x, 0, x.size, t) }
+            } else sib.forEach { it.send(d, o, c, t) }
             stats[id]?.let { synchronized(it) { it.fwd += c } }
         }
         hubSinks[id]?.forEach { it.send(d, o, c, t) }
@@ -312,6 +327,38 @@ object Router {
             l.inp?.close(); l.out?.close(); l.devs.forEach { it.close() }
         } catch (_: Exception) {}
         links.remove(l)
+    }
+}
+
+
+/** Envia cap a uae4arm a velocitat de port sèrie MIDI (31250 baud = 320 µs/byte), en trossos de 3 bytes. */
+object Pacer {
+    private val q = java.util.concurrent.LinkedBlockingQueue<ByteArray>()
+    @Volatile var queued = 0
+    @Volatile var dropped = 0L
+    private var started = false
+
+    @Synchronized private fun start() {
+        if (started) return
+        started = true
+        Thread {
+            while (true) {
+                val chunk = try { q.take() } catch (e: InterruptedException) { return@Thread }
+                var i = 0
+                while (i < chunk.size) {
+                    val n = minOf(3, chunk.size - i)
+                    try { Router.hubOut[1]?.invoke()?.forEach { it.send(chunk, i, n) } } catch (_: Exception) {}
+                    i += n; queued -= n
+                    java.util.concurrent.locks.LockSupport.parkNanos(n * 320_000L)
+                }
+            }
+        }.apply { isDaemon = true; start() }
+    }
+
+    fun push(x: ByteArray) {
+        if (x.isEmpty()) return
+        if (queued > 4096) { dropped += x.size; return }
+        queued += x.size; q.add(x); start()
     }
 }
 EOF_MP
