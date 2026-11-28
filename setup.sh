@@ -141,9 +141,11 @@ class MainActivity : Activity() {
         val btn = Button(this).apply { text = "Connecta" }
         val cbPace = CheckBox(this).apply { text = "Limita la velocitat cap a uae4arm (31250 baud)"; isChecked = true; setOnCheckedChangeListener { _, v -> Router.pace = v } }
         val cbFilt = CheckBox(this).apply { text = "Filtra rellotge i actius (F8/FE) cap a uae4arm"; setOnCheckedChangeListener { _, v -> Router.filterRt = v } }
+        val testTxt = "Prova: envia notes a uae4arm (on/off)"
+        val btnTest = Button(this).apply { text = testTxt; setOnClickListener { text = if (Router.toggleTest()) "Prova ACTIVA (toca per aturar)" else testTxt } }
         root.addView(label("Origen (sortida MIDI)")); root.addView(srcSp)
         root.addView(label("Destí (entrada MIDI)")); root.addView(dstSp)
-        root.addView(btn); root.addView(status); root.addView(cbPace); root.addView(cbFilt)
+        root.addView(btn); root.addView(status); root.addView(cbPace); root.addView(cbFilt); root.addView(btnTest)
         root.addView(label("Monitor MIDI (rebut pels dispositius virtuals)")); root.addView(mon)
         root.addView(label("Connexions actives (toca per desconnectar)")); root.addView(list, LinearLayout.LayoutParams(-1, 500))
         root.addView(label("Dispositius MIDI del sistema (en l'ordre real)")); root.addView(diag)
@@ -253,6 +255,22 @@ object Router {
         }
     }
     private val toHub = mapOf(1 to makeTo(1), 2 to makeTo(2))
+
+    @Volatile private var testOn = false
+    private fun sendA(b: ByteArray) { try { hubOut[1]?.invoke()?.forEach { it.send(b, 0, b.size) } } catch (_: Exception) {} }
+    /** Envia notes de prova (A, B, C, D) directament a la sortida d'A, que és la que llegeix uae4arm. */
+    fun toggleTest(): Boolean {
+        testOn = !testOn
+        if (testOn) Thread {
+            var n = 0
+            while (testOn) {
+                val note = 0x41 + (n++ % 4)
+                sendA(byteArrayOf(0x90.toByte(), note.toByte(), 0x40)); Thread.sleep(150)
+                sendA(byteArrayOf(0x80.toByte(), note.toByte(), 0x00)); Thread.sleep(350)
+            }
+        }.apply { isDaemon = true; start() }
+        return testOn
+    }
 
     fun init(c: Context) { mgr = c.applicationContext.getSystemService(Context.MIDI_SERVICE) as MidiManager }
 
